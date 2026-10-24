@@ -56,20 +56,6 @@ func CompressImage(r io.Reader, quality int) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// ValidateImage checks if the uploaded file is valid and within the size limit.
-package imageutil
-
-import (
-	"errors"
-	"fmt"
-	"image"
-	_ "image/jpeg"
-	_ "image/png"
-	"io"
-	"mime/multipart"
-	"net/http"
-)
-
 // ValidateImage checks file size, magic bytes, and structural integrity, 
 // then resets the file read pointer for downstream use.
 func ValidateImage(fileHeader *multipart.FileHeader, fieldName string, maxBytes int64) (multipart.File, error) {
@@ -85,7 +71,7 @@ func ValidateImage(fileHeader *multipart.FileHeader, fieldName string, maxBytes 
 	if err != nil {
 		return nil, errors.New("unable to read uploaded file")
 	}
-	
+
 	// Note: We don't defer file.Close() here because we want to return the 
 	// open file back to the handler so it can be saved or compressed next!
 
