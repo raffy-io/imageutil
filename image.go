@@ -57,31 +57,74 @@ func CompressImage(r io.Reader, quality int) ([]byte, error) {
 }
 
 // ValidateImage checks if the uploaded file is valid and within the size limit.
-func ValidateImage(fileHeader *multipart.FileHeader, fieldName string, maxBytes int64) error {
+package imageutil
+
+import (
+	"errors"
+	"fmt"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
+	"io"
+	"mime/multipart"
+	"net/http"
+)
+
+// ValidateImage checks file size, magic bytes, and structural integrity, 
+// then resets the file read pointer for downstream use.
+func ValidateImage(fileHeader *multipart.FileHeader, fieldName string, maxBytes int64) (multipart.File, error) {
 	if fileHeader == nil {
-		return fmt.Errorf("%s image is required", fieldName)
+		return nil, fmt.Errorf("%s image is required", fieldName)
 	}
 
 	if fileHeader.Size > maxBytes {
-		return fmt.Errorf("image size exceeds the maximum allowed limit")
+		return nil, fmt.Errorf("image size exceeds the maximum allowed limit")
 	}
 
 	file, err := fileHeader.Open()
 	if err != nil {
-		return errors.New("unable to read uploaded file")
+		return nil, errors.New("unable to read uploaded file")
 	}
-	defer file.Close()
+	
+	// Note: We don't defer file.Close() here because we want to return the 
+	// open file back to the handler so it can be saved or compressed next!
 
+	// 1. Check magic bytes (content type)
 	buffer := make([]byte, 512)
 	_, err = file.Read(buffer)
 	if err != nil {
-		return errors.New("unable to verify file type")
+		file.Close()
+		return nil, errors.New("unable to verify file type")
 	}
 
 	contentType := http.DetectContentType(buffer)
 	if contentType != "image/jpeg" && contentType != "image/png" && contentType != "image/webp" {
-		return errors.New("invalid image format. Only JPEG, PNG, and WebP are allowed")
+		file.Close()
+		return nil, errors.New("invalid image format. Only JPEG, PNG, and WebP are allowed")
 	}
 
-	return nil
+	// 2. Reset pointer to start so DecodeConfig can read the whole header
+	if seeker, ok := file.(io.Seeker); ok {
+		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+			file.Close()
+			return nil, errors.New("unable to process uploaded file")
+		}
+	}
+
+	// 3. Structurally verify it's a valid image (catches corrupted files & spoofed extensions)
+	_, _, err = image.DecodeConfig(file)
+	if err != nil {
+		file.Close()
+		return nil, errors.New("invalid or corrupted image file structure")
+	}
+
+	// 4. Reset pointer AGAIN so downstream compression/saving can read from byte 0
+	if seeker, ok := file.(io.Seeker); ok {
+		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+			file.Close()
+			return nil, errors.New("unable to process uploaded file")
+		}
+	}
+
+	return file, nil
 }
