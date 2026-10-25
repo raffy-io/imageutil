@@ -13,14 +13,20 @@ import (
 	"os"
 
 	webp "github.com/mayahiro/go-webp"
+	"golang.org/x/image/draw"
 )
 
-// SaveCompressedImage takes any io.Reader, compresses it, and saves it to disk
+const maxImageWidth = 1920
+
+// SaveCompressedImage takes any io.Reader, resizes if too large, compresses, and saves to disk
 func SaveCompressedImage(r io.Reader, outputPath string, quality int) error {
 	img, _, err := image.Decode(r)
 	if err != nil {
 		return err
 	}
+
+	// Resize to prevent massive CPU bottlenecks on large smartphone photos
+	img = resizeIfNeeded(img, maxImageWidth)
 
 	out, err := os.Create(outputPath)
 	if err != nil {
@@ -36,12 +42,15 @@ func SaveCompressedImage(r io.Reader, outputPath string, quality int) error {
 	return webp.Encode(out, img, options)
 }
 
-// CompressImage takes any io.Reader and returns WebP bytes
+// CompressImage takes any io.Reader, resizes if too large, and returns WebP bytes
 func CompressImage(r io.Reader, quality int) ([]byte, error) {
 	img, _, err := image.Decode(r)
 	if err != nil {
 		return nil, err
 	}
+
+	// Resize to prevent massive CPU bottlenecks on large smartphone photos
+	img = resizeIfNeeded(img, maxImageWidth)
 
 	var buf bytes.Buffer
 	options := &webp.Options{
@@ -54,6 +63,26 @@ func CompressImage(r io.Reader, quality int) ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+// resizeIfNeeded downscales the image proportionally if it exceeds maxWidth
+func resizeIfNeeded(src image.Image, maxWidth int) image.Image {
+	bounds := src.Bounds()
+	origWidth := bounds.Dx()
+
+	// If the image is already smaller than maxWidth, leave it alone
+	if origWidth <= maxWidth {
+		return src
+	}
+
+	origHeight := bounds.Dy()
+	targetWidth := maxWidth
+	targetHeight := (origHeight * targetWidth) / origWidth
+
+	dst := image.NewRGBA(image.Rect(0, 0, targetWidth, targetHeight))
+	draw.BiLinear.Scale(dst, dst.Bounds(), src, bounds, draw.Over, nil)
+
+	return dst
 }
 
 // ValidateImage checks file size, magic bytes, and structural integrity, 
@@ -71,9 +100,6 @@ func ValidateImage(fileHeader *multipart.FileHeader, fieldName string, maxBytes 
 	if err != nil {
 		return nil, errors.New("unable to read uploaded file")
 	}
-
-	// Note: We don't defer file.Close() here because we want to return the 
-	// open file back to the handler so it can be saved or compressed next!
 
 	// 1. Check magic bytes (content type)
 	buffer := make([]byte, 512)
