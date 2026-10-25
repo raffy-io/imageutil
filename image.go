@@ -9,11 +9,14 @@ import (
 	_ "image/png"
 	"io"
 	"mime/multipart"
-	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 
 	webp "github.com/mayahiro/go-webp"
+	_ "github.com/vegidio/avif-go" // Registers AVIF decoder
 	"golang.org/x/image/draw"
+	_ "golang.org/x/image/webp" // Registers WebP decoder
 )
 
 const (
@@ -22,7 +25,7 @@ const (
 	maxAllowedHeight = 4000
 )
 
-// SaveCompressedImage takes any io.Reader, resizes if too large, compresses, and saves to disk
+// SaveCompressedImage takes any io.Reader, resizes if too large, compresses to WebP, and saves to disk
 func SaveCompressedImage(r io.Reader, outputPath string, quality int) error {
 	img, _, err := image.Decode(r)
 	if err != nil {
@@ -74,7 +77,6 @@ func resizeIfNeeded(src image.Image, maxWidth int) image.Image {
 	bounds := src.Bounds()
 	origWidth := bounds.Dx()
 
-	// If the image is already smaller than maxWidth, leave it alone
 	if origWidth <= maxWidth {
 		return src
 	}
@@ -89,7 +91,7 @@ func resizeIfNeeded(src image.Image, maxWidth int) image.Image {
 	return dst
 }
 
-// ValidateImage checks file size, magic bytes, structural integrity, and maximum dimensions, 
+// ValidateImage checks file size, allowed extensions, structural integrity, and maximum dimensions, 
 // then resets the file read pointer for downstream use.
 func ValidateImage(fileHeader *multipart.FileHeader, fieldName string, maxBytes int64) (multipart.File, error) {
 	if fileHeader == nil {
@@ -100,34 +102,18 @@ func ValidateImage(fileHeader *multipart.FileHeader, fieldName string, maxBytes 
 		return nil, fmt.Errorf("image size exceeds the maximum allowed limit")
 	}
 
+	// Validate extension to block dangerous non-image uploads instantly
+	ext := strings.ToLower(filepath.Ext(fileHeader.Filename))
+	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".webp" && ext != ".avif" {
+		return nil, errors.New("invalid image format. Only JPEG, PNG, WebP, and AVIF are allowed")
+	}
+
 	file, err := fileHeader.Open()
 	if err != nil {
 		return nil, errors.New("unable to read uploaded file")
 	}
 
-	// 1. Check magic bytes (content type)
-	buffer := make([]byte, 512)
-	_, err = file.Read(buffer)
-	if err != nil {
-		file.Close()
-		return nil, errors.New("unable to verify file type")
-	}
-
-	contentType := http.DetectContentType(buffer)
-	if contentType != "image/jpeg" && contentType != "image/png" && contentType != "image/webp" {
-		file.Close()
-		return nil, errors.New("invalid image format. Only JPEG, PNG, and WebP are allowed")
-	}
-
-	// 2. Reset pointer to start so DecodeConfig can read the whole header
-	if seeker, ok := file.(io.Seeker); ok {
-		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
-			file.Close()
-			return nil, errors.New("unable to process uploaded file")
-		}
-	}
-
-	// 3. Structurally verify it's a valid image and check dimensions to block rogue high-res files
+	// Structurally verify it's a valid image and check dimensions via registered decoders
 	config, _, err := image.DecodeConfig(file)
 	if err != nil {
 		file.Close()
@@ -140,7 +126,7 @@ func ValidateImage(fileHeader *multipart.FileHeader, fieldName string, maxBytes 
 			config.Width, config.Height, maxAllowedWidth, maxAllowedHeight)
 	}
 
-	// 4. Reset pointer AGAIN so downstream compression/saving can read from byte 0
+	// Reset pointer so downstream compression/saving can read from byte 0
 	if seeker, ok := file.(io.Seeker); ok {
 		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
 			file.Close()
