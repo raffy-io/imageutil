@@ -19,8 +19,8 @@ import (
 
 const (
 	MaxImageWidth    = 1920
-	MaxAllowedWidth  = 4000
-	MaxAllowedHeight = 4000
+	MaxAllowedWidth  = 15000
+	MaxAllowedHeight = 15000
 )
 
 // ValidateImage checks file size, extension, structural integrity, and dimensions
