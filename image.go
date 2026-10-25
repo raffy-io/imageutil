@@ -16,7 +16,11 @@ import (
 	"golang.org/x/image/draw"
 )
 
-const maxImageWidth = 1920
+const (
+	maxImageWidth    = 1920
+	maxAllowedWidth  = 4000
+	maxAllowedHeight = 4000
+)
 
 // SaveCompressedImage takes any io.Reader, resizes if too large, compresses, and saves to disk
 func SaveCompressedImage(r io.Reader, outputPath string, quality int) error {
@@ -85,7 +89,7 @@ func resizeIfNeeded(src image.Image, maxWidth int) image.Image {
 	return dst
 }
 
-// ValidateImage checks file size, magic bytes, and structural integrity, 
+// ValidateImage checks file size, magic bytes, structural integrity, and maximum dimensions, 
 // then resets the file read pointer for downstream use.
 func ValidateImage(fileHeader *multipart.FileHeader, fieldName string, maxBytes int64) (multipart.File, error) {
 	if fileHeader == nil {
@@ -123,11 +127,17 @@ func ValidateImage(fileHeader *multipart.FileHeader, fieldName string, maxBytes 
 		}
 	}
 
-	// 3. Structurally verify it's a valid image (catches corrupted files & spoofed extensions)
-	_, _, err = image.DecodeConfig(file)
+	// 3. Structurally verify it's a valid image and check dimensions to block rogue high-res files
+	config, _, err := image.DecodeConfig(file)
 	if err != nil {
 		file.Close()
 		return nil, errors.New("invalid or corrupted image file structure")
+	}
+
+	if config.Width > maxAllowedWidth || config.Height > maxAllowedHeight {
+		file.Close()
+		return nil, fmt.Errorf("image dimensions are too large (%dx%dpx). Maximum allowed is %dx%dpx", 
+			config.Width, config.Height, maxAllowedWidth, maxAllowedHeight)
 	}
 
 	// 4. Reset pointer AGAIN so downstream compression/saving can read from byte 0
