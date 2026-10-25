@@ -8,8 +8,6 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
-	"mime/multipart"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -20,33 +18,59 @@ import (
 )
 
 const (
-	maxImageWidth    = 1920
-	maxAllowedWidth  = 4000
-	maxAllowedHeight = 4000
+	MaxImageWidth    = 1920
+	MaxAllowedWidth  = 4000
+	MaxAllowedHeight = 4000
 )
 
-// SaveCompressedImage takes any io.Reader, resizes if too large, compresses, and saves to disk
-func SaveCompressedImage(r io.Reader, outputPath string, quality int) error {
-	img, _, err := image.Decode(r)
+// ValidateImage checks file size, extension, structural integrity, and dimensions
+// using any io.ReadSeeker, making it reusable across HTTP, CLI, and S3.
+func ValidateImage(r io.ReadSeeker, filename string, fileSize int64, maxBytes int64) error {
+	if fileSize > maxBytes {
+		return errors.New("image size exceeds the maximum allowed limit")
+	}
+
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".webp" && ext != ".avif" {
+		return errors.New("invalid image format. Only JPEG, PNG, WebP, and AVIF are allowed")
+	}
+
+	config, _, err := image.DecodeConfig(r)
 	if err != nil {
-		return err
+		return errors.New("invalid or corrupted image file structure")
 	}
 
-	// Resize to prevent massive CPU bottlenecks on large smartphone photos
-	img = resizeIfNeeded(img, maxImageWidth)
-
-	out, err := os.Create(outputPath)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	options := &webp.Options{
-		Compression: webp.CompressionLossy,
-		Quality:     quality,
+	if config.Width > MaxAllowedWidth || config.Height > MaxAllowedHeight {
+		return fmt.Errorf("image dimensions are too large (%dx%dpx). Maximum allowed is %dx%dpx",
+			config.Width, config.Height, MaxAllowedWidth, MaxAllowedHeight)
 	}
 
-	return webp.Encode(out, img, options)
+	// Reset read pointer so downstream processing can read from byte 0
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return errors.New("unable to process image stream")
+	}
+
+	return nil
+}
+
+// ProcessImage smartly bypasses re-encoding if the file is already a valid, small-enough WebP
+func ProcessImage(r io.ReadSeeker, filename string, quality int) ([]byte, error) {
+	ext := strings.ToLower(filepath.Ext(filename))
+
+	if ext == ".webp" {
+		config, _, err := image.DecodeConfig(r)
+		r.Seek(0, io.SeekStart)
+
+		if err == nil && config.Width <= MaxImageWidth {
+			bytesData, readErr := io.ReadAll(r)
+			if readErr == nil {
+				return bytesData, nil
+			}
+		}
+		r.Seek(0, io.SeekStart)
+	}
+
+	return CompressImage(r, quality)
 }
 
 // CompressImage takes any io.Reader, resizes if too large, and returns WebP bytes
@@ -56,8 +80,7 @@ func CompressImage(r io.Reader, quality int) ([]byte, error) {
 		return nil, err
 	}
 
-	// Resize to prevent massive CPU bottlenecks on large smartphone photos
-	img = resizeIfNeeded(img, maxImageWidth)
+	img = resizeIfNeeded(img, MaxImageWidth)
 
 	var buf bytes.Buffer
 	options := &webp.Options{
@@ -72,40 +95,10 @@ func CompressImage(r io.Reader, quality int) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// ProcessImage smartly bypasses re-encoding if the file is already a valid, small-enough WebP, 
-// otherwise it falls back to the full compression and resizing pipeline.
-func ProcessImage(file io.Reader, filename string, quality int) ([]byte, error) {
-	ext := strings.ToLower(filepath.Ext(filename))
-
-	if ext == ".webp" {
-		config, _, err := image.DecodeConfig(file)
-		if seeker, ok := file.(io.Seeker); ok {
-			seeker.Seek(0, io.SeekStart)
-		}
-
-		// If valid WebP and within size limits, use raw bytes directly to prevent generational quality loss
-		if err == nil && config.Width <= maxImageWidth {
-			bytesData, readErr := io.ReadAll(file)
-			if readErr == nil {
-				return bytesData, nil
-			}
-		}
-	}
-
-	// Reset pointer for safety before standard compression
-	if seeker, ok := file.(io.Seeker); ok {
-		seeker.Seek(0, io.SeekStart)
-	}
-
-	return CompressImage(file, quality)
-}
-
-// resizeIfNeeded downscales the image proportionally if it exceeds maxWidth
 func resizeIfNeeded(src image.Image, maxWidth int) image.Image {
 	bounds := src.Bounds()
 	origWidth := bounds.Dx()
 
-	// If the image is already smaller than maxWidth, leave it alone
 	if origWidth <= maxWidth {
 		return src
 	}
@@ -118,50 +111,4 @@ func resizeIfNeeded(src image.Image, maxWidth int) image.Image {
 	draw.BiLinear.Scale(dst, dst.Bounds(), src, bounds, draw.Over, nil)
 
 	return dst
-}
-
-// ValidateImage checks file size, extension, structural integrity, and maximum dimensions, 
-// then resets the file read pointer for downstream use.
-func ValidateImage(fileHeader *multipart.FileHeader, fieldName string, maxBytes int64) (multipart.File, error) {
-	if fileHeader == nil {
-		return nil, fmt.Errorf("%s image is required", fieldName)
-	}
-
-	if fileHeader.Size > maxBytes {
-		return nil, fmt.Errorf("image size exceeds the maximum allowed limit")
-	}
-
-	// Validate extension to support JPEG, PNG, WebP, and AVIF safely
-	ext := strings.ToLower(filepath.Ext(fileHeader.Filename))
-	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".webp" && ext != ".avif" {
-		return nil, errors.New("invalid image format. Only JPEG, PNG, WebP, and AVIF are allowed")
-	}
-
-	file, err := fileHeader.Open()
-	if err != nil {
-		return nil, errors.New("unable to read uploaded file")
-	}
-
-	// Structurally verify it's a valid image and check dimensions via registered decoders
-	config, _, err := image.DecodeConfig(file)
-	if err != nil {
-		file.Close()
-		return nil, errors.New("invalid or corrupted image file structure")
-	}
-
-	if config.Width > maxAllowedWidth || config.Height > maxAllowedHeight {
-		file.Close()
-		return nil, fmt.Errorf("image dimensions are too large (%dx%dpx). Maximum allowed is %dx%dpx", 
-			config.Width, config.Height, maxAllowedWidth, maxAllowedHeight)
-	}
-
-	// Reset pointer so downstream compression/saving can read from byte 0
-	if seeker, ok := file.(io.Seeker); ok {
-		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
-			file.Close()
-			return nil, errors.New("unable to process uploaded file")
-		}
-	}
-
-	return file, nil
 }
